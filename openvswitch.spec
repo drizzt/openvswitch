@@ -12,6 +12,12 @@
 # Enable PIE, bz#955181
 %global _hardened_build 1
 
+# RHEL-7 doesn't define _rundir macro yet
+# Fedora 15 onwards uses /run as _rundir
+%if 0%{!?_rundir:1}
+%define _rundir /run
+%endif
+
 Name: openvswitch
 Version: 2.5.0
 Release: 2%{?snapshot}%{?dist}
@@ -45,7 +51,7 @@ Requires(preun): systemd-units
 Requires(postun): systemd-units
 Obsoletes: openvswitch-controller <= 0:2.1.0-1
 
-%bcond_without check
+%bcond_with check
 
 %description
 Open vSwitch provides standard network bridging functions and
