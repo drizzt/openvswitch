@@ -1,0 +1,46 @@
+From 5c802691f18fc793598b309e3c9893acf8e8bf02 Mon Sep 17 00:00:00 2001
+From: Alan Pevec <alan.pevec@redhat.com>
+Date: Fri, 10 Feb 2017 08:43:58 -0500
+Subject: [PATCH] rhel: make openvswitch service start return when ready
+
+In OVS 2.6 openvswitch systemd service was changed to use BindsTo
+instead of Requires for sub-services but also removed them from After
+
+This made main openvswitch service return before sub-services were ready
+breaking scripts which assumed everything is ready after systemctl start
+e.g. in OpenStack CI infra [1] is calling ovs-vsctl immediately after
+service start exposing a race in virtualized CI environment:
+2017-02-09T23:11:12.498Z|00007|bridge|INFO|ovs-vswitchd (Open vSwitch) 2.6.1
+but ovs-ctl tried to access it few msec too early:
+2017-02-09 23:11:12.352493 | ovs-vsctl: unix:/var/run/openvswitch/db.sock: database connection failed (No such file or directory)
+
+Solution is to add ordering dependencies, BindsTo/Requires do not ensure it [2]
+
+Fixes: 84ad120 ("rhel: Improved Systemd Integration")
+
+[1] https://github.com/openstack-infra/devstack-gate/blob/c435a724bd257b22a2e39e8e9125c11302a8c81d/functions.sh#L1057-L1078
+
+[2] https://www.freedesktop.org/software/systemd/man/systemd.unit.html#Requires=
+
+Signed-off-by: Alan Pevec <alan.pevec@redhat.com>
+Reviewed-by: Aaron Conole <aconole@redhat.com>
+---
+ rhel/usr_lib_systemd_system_openvswitch.service | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/rhel/usr_lib_systemd_system_openvswitch.service b/rhel/usr_lib_systemd_system_openvswitch.service
+index e823c54..bdbceae 100644
+--- a/rhel/usr_lib_systemd_system_openvswitch.service
++++ b/rhel/usr_lib_systemd_system_openvswitch.service
+@@ -1,7 +1,7 @@
+ [Unit]
+ Description=Open vSwitch
+ Before=network.target network.service
+-After=network-pre.target
++After=network-pre.target ovsdb-server.service ovs-vswitchd.service
+ PartOf=network.target
+ BindsTo=ovsdb-server.service
+ BindsTo=ovs-vswitchd.service
+-- 
+2.9.3
+

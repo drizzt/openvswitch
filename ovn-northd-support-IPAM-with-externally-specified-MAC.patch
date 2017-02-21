@@ -1,0 +1,239 @@
+commit a1fd049626e1e8e7c2b957ff1933e776169bb20d
+Author: Lance Richardson <lrichard@redhat.com>
+Date:   Fri Dec 9 15:37:06 2016 -0500
+
+    Backport of ovn-northd: support IPAM with externally specified MAC
+    The only conflict requiring manual editing was the NEWS file update.
+    
+    commit 6374d5185d877e29eb32edc8a1bb34099b1b2bbf
+    Author: Lance Richardson <lrichard@redhat.com>
+    Date:   Thu Oct 6 15:58:51 2016 -0400
+    
+        ovn-northd: support IPAM with externally specified MAC
+    
+        The current IPAM implementation allocates both a MAC address and
+        an IPv4 address when dynamic address allocation is requested. This
+        patch adds the ability to specify a fixed MAC address for use with
+        dynamic IPv4 address allocation.
+    
+        Example:
+           ovn-nbctl lsp-set-addresses p1 "00:01:02:03:04:05 dynamic"
+    
+        Acked-by: Ben Pfaff <blp@ovn.org>
+        Acked-by: Russell Bryant <russell@ovn.org>
+        Signed-off-by: Lance Richardson <lrichard@redhat.com>
+        Signed-off-by: Ben Pfaff <blp@ovn.org>
+
+diff --git a/NEWS b/NEWS
+index 0f4d6c3..dc913fd 100644
+--- a/NEWS
++++ b/NEWS
+@@ -8,6 +8,8 @@ v2.6.1 - 06 Dec 2016
+      * A package upgrade does not automatically restart OVS service.
+    - Bug fixes
+    - Added support for DPDK 16.11
++   - OVN:
++     * IPAM now supports fixed MAC addresses.
+ 
+ v2.6.0 - 27 Sep 2016
+ ---------------------
+diff --git a/ovn/lib/ovn-util.c b/ovn/lib/ovn-util.c
+index 5dbc138..99e4a0e 100644
+--- a/ovn/lib/ovn-util.c
++++ b/ovn/lib/ovn-util.c
+@@ -62,6 +62,26 @@ add_ipv6_netaddr(struct lport_addresses *laddrs, struct in6_addr addr,
+     inet_ntop(AF_INET6, &na->network, na->network_s, sizeof na->network_s);
+ }
+ 
++/* Returns true if specified address specifies a dynamic address,
++ * supporting the following formats:
++ *
++ *    "dynamic":
++ *        Both MAC and IP are to be allocated dynamically.
++ *
++ *    "xx:xx:xx:xx:xx:xx dynamic":
++ *        Use specified MAC address, but allocate an IP address
++ *        dynamically.
++ */
++bool
++is_dynamic_lsp_address(const char *address)
++{
++    struct eth_addr ea;
++    int n;
++    return (!strcmp(address, "dynamic")
++            || (ovs_scan(address, ETH_ADDR_SCAN_FMT" dynamic%n",
++                         ETH_ADDR_SCAN_ARGS(ea), &n) && address[n] == '\0'));
++}
++
+ /* Extracts the mac, IPv4 and IPv6 addresses from * 'address' which
+  * should be of the format 'MAC [IP1 IP2 ..]" where IPn should be a
+  * valid IPv4 or IPv6 address and stores them in the 'ipv4_addrs' and
+diff --git a/ovn/lib/ovn-util.h b/ovn/lib/ovn-util.h
+index 2329111..30b27b1 100644
+--- a/ovn/lib/ovn-util.h
++++ b/ovn/lib/ovn-util.h
+@@ -53,7 +53,7 @@ struct lport_addresses {
+     struct ipv6_netaddr *ipv6_addrs;
+ };
+ 
+-
++bool is_dynamic_lsp_address(const char *address);
+ bool extract_lsp_addresses(const char *address, struct lport_addresses *);
+ bool extract_lrp_networks(const struct nbrec_logical_router_port *,
+                           struct lport_addresses *);
+diff --git a/ovn/northd/ovn-northd.c b/ovn/northd/ovn-northd.c
+index 9c9a3b3..d504948 100644
+--- a/ovn/northd/ovn-northd.c
++++ b/ovn/northd/ovn-northd.c
+@@ -732,7 +732,7 @@ ipam_insert_lsp_addresses(struct ovn_datapath *od, struct ovn_port *op,
+                           char *address)
+ {
+     if (!od || !op || !address || !strcmp(address, "unknown")
+-        || !strcmp(address, "dynamic")) {
++        || is_dynamic_lsp_address(address)) {
+         return;
+     }
+ 
+@@ -857,7 +857,7 @@ ipam_get_unused_ip(struct ovn_datapath *od, uint32_t subnet, uint32_t mask)
+ 
+ static bool
+ ipam_allocate_addresses(struct ovn_datapath *od, struct ovn_port *op,
+-                        ovs_be32 subnet, ovs_be32 mask)
++                        const char *addrspec, ovs_be32 subnet, ovs_be32 mask)
+ {
+     if (!od || !op || !op->nbsp) {
+         return false;
+@@ -869,16 +869,26 @@ ipam_allocate_addresses(struct ovn_datapath *od, struct ovn_port *op,
+     }
+ 
+     struct eth_addr mac;
+-    uint64_t mac64 = ipam_get_unused_mac();
+-    if (!mac64) {
+-        return false;
++    bool check_mac;
++    int n = 0;
++
++    if (ovs_scan(addrspec, ETH_ADDR_SCAN_FMT" dynamic%n",
++                 ETH_ADDR_SCAN_ARGS(mac), &n)
++        && addrspec[n] == '\0') {
++        check_mac = true;
++    } else {
++        uint64_t mac64 = ipam_get_unused_mac();
++        if (!mac64) {
++            return false;
++        }
++        eth_addr_from_uint64(mac64, &mac);
++        check_mac = false;
+     }
+-    eth_addr_from_uint64(mac64, &mac);
+ 
+     /* Add MAC/IP to MACAM/IPAM hmaps if both addresses were allocated
+      * successfully. */
+     ipam_insert_ip(od, ip, false);
+-    ipam_insert_mac(&mac, false);
++    ipam_insert_mac(&mac, check_mac);
+ 
+     char *new_addr = xasprintf(ETH_ADDR_FMT" "IP_FMT,
+                                ETH_ADDR_ARGS(mac), IP_ARGS(htonl(ip)));
+@@ -935,9 +945,10 @@ build_ipam(struct hmap *datapaths, struct hmap *ports)
+                 }
+ 
+                 for (size_t j = 0; j < nbsp->n_addresses; j++) {
+-                    if (!strcmp(nbsp->addresses[j], "dynamic")
++                    if (is_dynamic_lsp_address(nbsp->addresses[j])
+                         && !nbsp->dynamic_addresses) {
+-                        if (!ipam_allocate_addresses(od, op, subnet, mask)
++                        if (!ipam_allocate_addresses(od, op,
++                                             nbsp->addresses[j], subnet, mask)
+                             || !extract_lsp_addresses(nbsp->dynamic_addresses,
+                                             &op->lsp_addrs[op->n_lsp_addrs])) {
+                             static struct vlog_rate_limit rl
+@@ -1104,7 +1115,7 @@ join_logical_ports(struct northd_context *ctx,
+                     if (!strcmp(nbsp->addresses[j], "unknown")) {
+                         continue;
+                     }
+-                    if (!strcmp(nbsp->addresses[j], "dynamic")) {
++                    if (is_dynamic_lsp_address(nbsp->addresses[j])) {
+                         if (nbsp->dynamic_addresses) {
+                             if (!extract_lsp_addresses(nbsp->dynamic_addresses,
+                                             &op->lsp_addrs[op->n_lsp_addrs])) {
+@@ -2922,7 +2933,7 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
+                     ovn_multicast_add(mcgroups, &mc_unknown, op);
+                     op->od->has_unknown = true;
+                 }
+-            } else if (!strcmp(op->nbsp->addresses[i], "dynamic")) {
++            } else if (is_dynamic_lsp_address(op->nbsp->addresses[i])) {
+                 if (!op->nbsp->dynamic_addresses
+                     || !eth_addr_from_string(op->nbsp->dynamic_addresses,
+                                             &mac)) {
+diff --git a/ovn/ovn-nb.xml b/ovn/ovn-nb.xml
+index dc10491..5c227dd 100644
+--- a/ovn/ovn-nb.xml
++++ b/ovn/ovn-nb.xml
+@@ -475,6 +475,35 @@
+             column="other_config" key="subnet"/> in the port's <ref
+             table="Logical_Switch"/>.
+           </dd>
++
++          <dt><code>Ethernet address followed by keyword "dynamic"</code></dt>
++          <dd>
++
++            <p>
++              The keyword <code>dynamic</code> after the MAC address indicates
++              that <code>ovn-northd</code> should choose an unused IPv4 address
++              from the logical port's subnet and store it with the specified
++              MAC in the port's <ref column="dynamic_addresses"/> column.
++              <code>ovn-northd</code> will use the subnet specified in <ref
++              table="Logical_Switch" column="other_config" key="subnet"/> in
++              the port's <ref table="Logical_Switch"/> table.
++            </p>
++
++            <p>
++              Examples:
++            </p>
++
++            <dl>
++              <dt><code>80:fa:5b:06:72:b7 dynamic</code></dt>
++              <dd>
++                This indicates that the logical port owns the specified
++                MAC address and <code>ovn-northd</code> should allocate an
++                unused IPv4 address for the logical port from the corresponding
++                logical switch subnet.
++              </dd>
++            </dl>
++          </dd>
++
+         </dl>
+       </column>
+ 
+@@ -483,9 +512,9 @@
+           Addresses assigned to the logical port by <code>ovn-northd</code>, if
+           <code>dynamic</code> is specified in <ref column="addresses"/>.
+           Addresses will be of the same format as those that populate the <ref
+-          column="addresses"/> column.  Note that these addresses are
+-          constructed and managed locally in ovn-northd, so they cannot be
+-          reconstructed in the event that the database is lost.
++          column="addresses"/> column.  Note that dynamically assigned
++          addresses are constructed and managed locally in ovn-northd, so they
++          cannot be reconstructed in the event that the database is lost.
+         </p>
+       </column>
+ 
+diff --git a/tests/ovn.at b/tests/ovn.at
+index 56d47e7..25a2633 100644
+--- a/tests/ovn.at
++++ b/tests/ovn.at
+@@ -4664,6 +4664,13 @@ AT_CHECK([ovn-nbctl get Logical-Switch-Port p30 dynamic_addresses], [0],
+      ["0a:00:00:00:00:20 192.168.1.17"
+ ])
+ 
++# Test static MAC address with dynamically allocated IP
++ovn-nbctl --wait=sb lsp-add sw0 p31 -- lsp-set-addresses p31 \
++"fe:dc:ba:98:76:54 dynamic"
++AT_CHECK([ovn-nbctl get Logical-Switch-Port p31 dynamic_addresses], [0],
++     ["fe:dc:ba:98:76:54 192.168.1.18"
++])
++
+ as ovn-sb
+ OVS_APP_EXIT_AND_WAIT([ovsdb-server])
+ 
