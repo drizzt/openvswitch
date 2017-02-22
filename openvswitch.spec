@@ -51,7 +51,7 @@ License: ASL 2.0 and LGPLv2+ and SISSL
 %define dpdksver %(echo %{dpdkver} | cut -d. -f-2)
 %define dpdktarget %{_arch}-native-linuxapp-gcc
 
-Release: %{?snapver:0.%{snapver}.}%{rel}%{?dist}
+Release: %{?snapver:0.%{snapver}.}%{rel}%{?dist}.1
 Source: http://openvswitch.org/releases/%{srcname}-%{srcver}.tar.gz
 Source10: http://dpdk.org/browse/dpdk/snapshot/dpdk-%{dpdkver}.tar.gz
 
@@ -128,7 +128,7 @@ Python bindings for the Open vSwitch database
 Summary: Open vSwitch testing utilities
 License: ASL 2.0
 BuildArch: noarch
-Requires: python-openvswitch = %{version}-%{release}
+Requires: python-openvswitch = %{epoch}:%{version}-%{release}
 Requires: python python-twisted-core python-twisted-web
 
 %description test
