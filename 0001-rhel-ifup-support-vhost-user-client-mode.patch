@@ -1,0 +1,46 @@
+From d46b603797c6fa8ab979e3de4ead73e50a37e7ec Mon Sep 17 00:00:00 2001
+From: Aaron Conole <aconole@bytheb.org>
+Date: Fri, 10 Feb 2017 12:49:38 -0500
+Subject: [PATCH] rhel/ifup: support vhost-user client mode
+
+This adds support for ifup to configure client-mode sockets by exposing
+two new variables $OVS_PORT_MODE and $OVS_PORT_PATH to the ifcfg
+scripts.  When OVS_PORT_MODE is set to 'client', the OVS_PORT_PATH will
+be passed as the vhost-server-path option.
+
+No change is needed to ifdown because the OVSDPDKVhostUserPort type
+already has an appropriate entry.
+
+Signed-off-by: Aaron Conole <aconole@redhat.com>
+Signed-off-by: Daniele Di Proietto <diproiettod@vmware.com>
+---
+ rhel/etc_sysconfig_network-scripts_ifup-ovs | 10 +++++++++-
+ 2 files changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/rhel/etc_sysconfig_network-scripts_ifup-ovs b/rhel/etc_sysconfig_network-scripts_ifup-ovs
+index e49e6fe..b95220a 100755
+--- a/rhel/etc_sysconfig_network-scripts_ifup-ovs
++++ b/rhel/etc_sysconfig_network-scripts_ifup-ovs
+@@ -181,10 +181,18 @@ case "$TYPE" in
+ 		;;
+ 	OVSDPDKVhostUserPort)
+ 		ifup_ovs_bridge
++		PORT_TYPE="dpdkvhostuser"
++		PORT_PATH=""
++		if [ "$OVS_PORT_MODE" == "client" ]; then
++			PORT_TYPE="dpdkvhostuserclient"
++			PORT_PATH="options:vhost-server-path=${OVS_PORT_PATH}"
++		fi
+ 		ovs-vsctl -t ${TIMEOUT} \
+ 			-- --if-exists del-port "$OVS_BRIDGE" "$DEVICE" \
+ 			-- add-port "$OVS_BRIDGE" "$DEVICE" $OVS_OPTIONS \
+-			-- set Interface "$DEVICE" type=dpdkvhostuser ${OVS_EXTRA+-- $OVS_EXTRA}
++			-- set Interface "$DEVICE" type=$PORT_TYPE \
++			$PORT_PATH \
++			${OVS_EXTRA+-- $OVS_EXTRA}
+ 		;;
+ 	OVSDPDKBond)
+ 		ifup_ovs_bridge
+-- 
+2.9.3
+

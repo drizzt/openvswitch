@@ -1,0 +1,824 @@
+diff --git a/FAQ.md b/FAQ.md
+index 8b73ab3..cf30f9b 100644
+--- a/FAQ.md
++++ b/FAQ.md
+@@ -143,5 +143,5 @@ A: All official releases have been through a comprehensive testing
+    fix.  Releases that are not LTS may not be fixed and may just be
+    supplanted by the next major release.  The current LTS release is
+-   2.3.x.
++   2.5.x.
+ 
+    For more information on the Open vSwitch release process, please
+diff --git a/NEWS b/NEWS
+index 4c1f391..9970297 100644
+--- a/NEWS
++++ b/NEWS
+@@ -1,2 +1,6 @@
++v2.6.2 - xx xxx xxxx
++---------------------
++
++
+ v2.6.1 - 01 Nov 2016
+ ---------------------
+diff --git a/configure.ac b/configure.ac
+index da3bbae..0338fd5 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -14,5 +14,5 @@
+ 
+ AC_PREREQ(2.63)
+-AC_INIT(openvswitch, 2.6.1, bugs@openvswitch.org)
++AC_INIT(openvswitch, 2.6.2, bugs@openvswitch.org)
+ AC_CONFIG_SRCDIR([datapath/datapath.c])
+ AC_CONFIG_MACRO_DIR([m4])
+diff --git a/datapath/conntrack.c b/datapath/conntrack.c
+index 824a33f..93f05c2 100644
+--- a/datapath/conntrack.c
++++ b/datapath/conntrack.c
+@@ -425,6 +425,9 @@ static int handle_fragments(struct net *net, struct sw_flow_key *key,
+ 		memset(IP6CB(skb), 0, sizeof(struct inet6_skb_parm));
+ 		err = nf_ct_frag6_gather(net, skb, user);
+-		if (err)
++		if (err) {
++			if (err != -EINPROGRESS)
++				kfree_skb(skb);
+ 			return err;
++		}
+ 
+ 		key->ip.proto = ipv6_hdr(skb)->nexthdr;
+diff --git a/datapath/linux/compat/vxlan.c b/datapath/linux/compat/vxlan.c
+index d5dbe8d..3abcab1 100644
+--- a/datapath/linux/compat/vxlan.c
++++ b/datapath/linux/compat/vxlan.c
+@@ -321,5 +321,5 @@ static struct sk_buff **vxlan_gro_receive(struct sk_buff **head,
+ 	flags = vh->vx_flags;
+ 
+-	if ((flags & VXLAN_HF_RCO) && (vs->flags & VXLAN_F_REMCSUM_RX)) {
++	if ((flags & VXLAN_HF_RCO) && vs && (vs->flags & VXLAN_F_REMCSUM_RX)) {
+ 		vh = vxlan_gro_remcsum(skb, off_vx, vh, sizeof(struct vxlanhdr),
+ 				       vh->vx_vni, &grc,
+diff --git a/debian/changelog b/debian/changelog
+index ab76870..58fd841 100644
+--- a/debian/changelog
++++ b/debian/changelog
+@@ -1,2 +1,10 @@
++openvswitch (2.6.2-1) unstable; urgency=low
++   [ Open vSwitch team ]
++   * New upstream version
++   - Nothing yet!
++
++ -- Open vSwitch team <dev@openvswitch.org>  Tue, 01 Nov 2016 15:42:39 -0700
++
++
+ openvswitch (2.6.1-1) unstable; urgency=low
+    [ Open vSwitch team ]
+diff --git a/include/openflow/openflow-1.4.h b/include/openflow/openflow-1.4.h
+index 4599f95..fcebe4e 100644
+--- a/include/openflow/openflow-1.4.h
++++ b/include/openflow/openflow-1.4.h
+@@ -40,4 +40,10 @@
+ #include <openflow/openflow-1.3.h>
+ 
++/* OpenFlow 1.4.1+ specific capabilities
++ * (struct ofp_switch_features, member capabilities). */
++enum ofp14_capabilities {
++    OFPC14_BUNDLES        = 1 << 9,    /* Switch supports bundles. */
++    OFPC14_FLOW_MONITORING = 1 << 10,  /* Switch supports flow monitoring. */
++};
+ 
+ /* ## ---------- ## */
+diff --git a/include/openvswitch/ofp-util.h b/include/openvswitch/ofp-util.h
+index 177bf2b..dd4d560 100644
+--- a/include/openvswitch/ofp-util.h
++++ b/include/openvswitch/ofp-util.h
+@@ -610,5 +610,5 @@ struct ofputil_phy_port {
+ 
+ enum ofputil_capabilities {
+-    /* OpenFlow 1.0, 1.1, 1.2, and 1.3 share these capability values. */
++    /* All OpenFlow versions share these capability values. */
+     OFPUTIL_C_FLOW_STATS     = 1 << 0,  /* Flow statistics. */
+     OFPUTIL_C_TABLE_STATS    = 1 << 1,  /* Table statistics. */
+@@ -623,9 +623,14 @@ enum ofputil_capabilities {
+     OFPUTIL_C_STP            = 1 << 3,  /* 802.1d spanning tree. */
+ 
+-    /* OpenFlow 1.1, 1.2, and 1.3 share this capability. */
++    /* OpenFlow 1.1+ only.  Note that this bit value does not match the one
++     * in the OpenFlow message. */
+     OFPUTIL_C_GROUP_STATS    = 1 << 4,  /* Group statistics. */
+ 
+-    /* OpenFlow 1.2 and 1.3 share this capability */
++    /* OpenFlow 1.2+ only. */
+     OFPUTIL_C_PORT_BLOCKED   = 1 << 8,  /* Switch will block looping ports */
++
++    /* OpenFlow 1.4+ only. */
++    OFPUTIL_C_BUNDLES         = 1 << 9,  /* Switch supports bundles. */
++    OFPUTIL_C_FLOW_MONITORING = 1 << 10, /* Switch supports flow monitoring. */
+ };
+ 
+diff --git a/lib/dpif-netdev.c b/lib/dpif-netdev.c
+index 44ec1a0..81c472d 100644
+--- a/lib/dpif-netdev.c
++++ b/lib/dpif-netdev.c
+@@ -1496,8 +1496,8 @@ get_n_pmd_threads_on_numa(struct dp_netdev *dp, int numa_id)
+ }
+ 
+-/* Returns 'true' if there is a port with pmd netdev and the netdev
+- * is on numa node 'numa_id'. */
++/* Returns 'true' if there is a port with pmd netdev and the netdev is on
++ * numa node 'numa_id' or its rx queue assigned to core on that numa node . */
+ static bool
+-has_pmd_port_for_numa(struct dp_netdev *dp, int numa_id)
++has_pmd_rxq_for_numa(struct dp_netdev *dp, int numa_id)
+     OVS_REQUIRES(dp->port_mutex)
+ {
+@@ -1505,7 +1505,19 @@ has_pmd_port_for_numa(struct dp_netdev *dp, int numa_id)
+ 
+     HMAP_FOR_EACH (port, node, &dp->ports) {
+-        if (netdev_is_pmd(port->netdev)
+-            && netdev_get_numa_id(port->netdev) == numa_id) {
+-            return true;
++        if (netdev_is_pmd(port->netdev)) {
++            int i;
++
++            if (netdev_get_numa_id(port->netdev) == numa_id) {
++                return true;
++            }
++
++            for (i = 0; i < port->n_rxq; i++) {
++                unsigned core_id = port->rxqs[i].core_id;
++
++                if (core_id != -1
++                    && ovs_numa_get_numa_id(core_id) == numa_id) {
++                    return true;
++                }
++            }
+         }
+     }
+@@ -1531,5 +1543,5 @@ do_del_port(struct dp_netdev *dp, struct dp_netdev_port *port)
+         /* If there is no netdev on the numa node, deletes the pmd threads
+          * for that numa. */
+-        if (!has_pmd_port_for_numa(dp, numa_id)) {
++        if (!has_pmd_rxq_for_numa(dp, numa_id)) {
+             dp_netdev_del_pmds_on_numa(dp, numa_id);
+         }
+@@ -3399,5 +3411,5 @@ dp_netdev_del_pmds_on_numa(struct dp_netdev *dp, int numa_id)
+          * 'dp->poll_threads' (while we're iterating it) and it
+          * might quiesce. */
+-        if (pmd->numa_id == numa_id) {
++        if (pmd->numa_id == numa_id && pmd->core_id != NON_PMD_CORE_ID) {
+             atomic_read_relaxed(&pmd->static_tx_qid, &free_idx[k]);
+             pmd_list[k] = pmd;
+@@ -3417,5 +3429,5 @@ dp_netdev_del_pmds_on_numa(struct dp_netdev *dp, int numa_id)
+         atomic_read_relaxed(&pmd->static_tx_qid, &old_tx_qid);
+ 
+-        if (old_tx_qid >= n_pmds) {
++        if (old_tx_qid >= n_pmds && pmd->core_id != NON_PMD_CORE_ID) {
+             int new_tx_qid = free_idx[--k];
+ 
+@@ -3737,7 +3749,25 @@ dp_netdev_reset_pmd_threads(struct dp_netdev *dp)
+     HMAP_FOR_EACH (port, node, &dp->ports) {
+         if (netdev_is_pmd(port->netdev)) {
+-            int numa_id = netdev_get_numa_id(port->netdev);
++            struct hmapx numas = HMAPX_INITIALIZER(&numas);
++            struct hmapx_node *numa_node;
++            uintptr_t numa_id;
++            int i;
+ 
+-            dp_netdev_set_pmds_on_numa(dp, numa_id);
++            numa_id = netdev_get_numa_id(port->netdev);
++            hmapx_add(&numas, (void *) numa_id);
++            for (i = 0; i < port->n_rxq; i++) {
++                unsigned core_id = port->rxqs[i].core_id;
++
++                if (core_id != -1) {
++                    numa_id = ovs_numa_get_numa_id(core_id);
++                    hmapx_add(&numas, (void *) numa_id);
++                }
++            }
++
++            HMAPX_FOR_EACH (numa_node, &numas) {
++                dp_netdev_set_pmds_on_numa(dp, (uintptr_t) numa_node->data);
++            }
++
++            hmapx_destroy(&numas);
+         }
+         /* Distribute only pinned rx queues first to mark threads as isolated */
+diff --git a/lib/netdev-dpdk.c b/lib/netdev-dpdk.c
+index 27b4ee2..cc70607 100644
+--- a/lib/netdev-dpdk.c
++++ b/lib/netdev-dpdk.c
+@@ -1024,4 +1024,8 @@ netdev_dpdk_vhost_destruct(struct netdev *netdev)
+     ovs_mutex_unlock(&dpdk_mutex);
+ 
++    if (!strlen(dev->vhost_id)) {
++        goto out;
++    }
++
+     if (dpdk_vhost_driver_unregister(dev, vhost_id)) {
+         VLOG_ERR("%s: Unable to unregister vhost driver for socket '%s'.\n",
+@@ -1031,4 +1035,5 @@ netdev_dpdk_vhost_destruct(struct netdev *netdev)
+         fatal_signal_remove_file_to_unlink(vhost_id);
+     }
++out:
+     free(vhost_id);
+ }
+@@ -1950,7 +1955,7 @@ static int
+ netdev_dpdk_get_features(const struct netdev *netdev,
+                          enum netdev_features *current,
+-                         enum netdev_features *advertised OVS_UNUSED,
+-                         enum netdev_features *supported OVS_UNUSED,
+-                         enum netdev_features *peer OVS_UNUSED)
++                         enum netdev_features *advertised,
++                         enum netdev_features *supported,
++                         enum netdev_features *peer)
+ {
+     struct netdev_dpdk *dev = netdev_dpdk_cast(netdev);
+@@ -1990,4 +1995,6 @@ netdev_dpdk_get_features(const struct netdev *netdev,
+     }
+ 
++    *advertised = *supported = *peer = 0;
++
+     return 0;
+ }
+@@ -2165,4 +2172,6 @@ netdev_dpdk_update_flags__(struct netdev_dpdk *dev,
+             rte_eth_dev_stop(dev->port_id);
+         }
++
++        netdev_change_seq_changed(&dev->up);
+     } else {
+         /* If DPDK_DEV_VHOST device's NETDEV_UP flag was changed and vhost is
+diff --git a/lib/netdev.c b/lib/netdev.c
+index 6c4c657..ee9b461 100644
+--- a/lib/netdev.c
++++ b/lib/netdev.c
+@@ -1914,5 +1914,5 @@ netdev_get_addrs(const char dev[], struct in6_addr **paddr,
+             sin = ALIGNED_CAST(const struct sockaddr_in *, ifa->ifa_addr);
+             in6_addr_set_mapped_ipv4(&addr_array[i], sin->sin_addr.s_addr);
+-            sin = (struct sockaddr_in *) &ifa->ifa_netmask;
++            sin = ALIGNED_CAST(const struct sockaddr_in *, ifa->ifa_netmask);
+             in6_addr_set_mapped_ipv4(&mask_array[i], sin->sin_addr.s_addr);
+             i++;
+@@ -1922,5 +1922,5 @@ netdev_get_addrs(const char dev[], struct in6_addr **paddr,
+             sin6 = ALIGNED_CAST(const struct sockaddr_in6 *, ifa->ifa_addr);
+             memcpy(&addr_array[i], &sin6->sin6_addr, sizeof *addr_array);
+-            sin6 = (struct sockaddr_in6 *) &ifa->ifa_netmask;
++            sin6 = ALIGNED_CAST(const struct sockaddr_in6 *, ifa->ifa_netmask);
+             memcpy(&mask_array[i], &sin6->sin6_addr, sizeof *mask_array);
+             i++;
+diff --git a/lib/ofp-print.c b/lib/ofp-print.c
+index 4a22e71..a499cd1 100644
+--- a/lib/ofp-print.c
++++ b/lib/ofp-print.c
+@@ -507,4 +507,6 @@ ofputil_capabilities_to_name(uint32_t bit)
+     case OFPUTIL_C_GROUP_STATS:  return "GROUP_STATS";
+     case OFPUTIL_C_PORT_BLOCKED: return "PORT_BLOCKED";
++    case OFPUTIL_C_BUNDLES:      return "BUNDLES";
++    case OFPUTIL_C_FLOW_MONITORING: return "FLOW_MONITORING";
+     }
+ 
+@@ -1262,4 +1264,5 @@ ofp_print_queue_get_config_reply(struct ds *string,
+     }
+     ds_chomp(string, ' ');
++    free(queues);
+ }
+ 
+diff --git a/lib/ofp-util.c b/lib/ofp-util.c
+index 5b23ac7..dd04911 100644
+--- a/lib/ofp-util.c
++++ b/lib/ofp-util.c
+@@ -4655,4 +4655,7 @@ BUILD_ASSERT_DECL((int) OFPUTIL_C_IP_REASM == OFPC_IP_REASM);
+ BUILD_ASSERT_DECL((int) OFPUTIL_C_QUEUE_STATS == OFPC_QUEUE_STATS);
+ BUILD_ASSERT_DECL((int) OFPUTIL_C_ARP_MATCH_IP == OFPC_ARP_MATCH_IP);
++BUILD_ASSERT_DECL((int) OFPUTIL_C_PORT_BLOCKED == OFPC12_PORT_BLOCKED);
++BUILD_ASSERT_DECL((int) OFPUTIL_C_BUNDLES == OFPC14_BUNDLES);
++BUILD_ASSERT_DECL((int) OFPUTIL_C_FLOW_MONITORING == OFPC14_FLOW_MONITORING);
+ 
+ static uint32_t
+@@ -4666,8 +4669,10 @@ ofputil_capabilities_mask(enum ofp_version ofp_version)
+     case OFP12_VERSION:
+     case OFP13_VERSION:
+-    case OFP14_VERSION:
+-    case OFP15_VERSION:
+-    case OFP16_VERSION:
+         return OFPC_COMMON | OFPC12_PORT_BLOCKED;
++    case OFP14_VERSION:
++    case OFP15_VERSION:
++    case OFP16_VERSION:
++        return OFPC_COMMON | OFPC12_PORT_BLOCKED | OFPC14_BUNDLES
++            | OFPC14_FLOW_MONITORING;
+     default:
+         /* Caller needs to check osf->header.version itself */
+@@ -4795,5 +4800,4 @@ ofputil_encode_switch_features(const struct ofputil_switch_features *features,
+     osf->n_tables = features->n_tables;
+ 
+-    osf->capabilities = htonl(features->capabilities & OFPC_COMMON);
+     osf->capabilities = htonl(features->capabilities &
+                               ofputil_capabilities_mask(version));
+diff --git a/lib/ovs-router.c b/lib/ovs-router.c
+index e27514a..935b60a 100644
+--- a/lib/ovs-router.c
++++ b/lib/ovs-router.c
+@@ -199,4 +199,7 @@ ovs_router_insert__(uint8_t priority, const struct in6_addr *ip6_dst,
+     p->priority = priority;
+     err = get_src_addr(ip6_dst, output_bridge, &p->src_addr);
++    if (err && ipv6_addr_is_set(gw)) {
++        err = get_src_addr(gw, output_bridge, &p->src_addr);
++    }
+     if (err) {
+         free(p);
+@@ -317,5 +320,5 @@ ovs_router_add(struct unixctl_conn *conn, int argc,
+     err = ovs_router_insert__(plen + 32, &ip6, plen, argv[2], &gw6);
+     if (err) {
+-        unixctl_command_reply(conn, "Error while inserting route.");
++        unixctl_command_reply_error(conn, "Error while inserting route.");
+     } else {
+         unixctl_command_reply(conn, "OK");
+@@ -400,5 +403,5 @@ ovs_router_lookup_cmd(struct unixctl_conn *conn, int argc OVS_UNUSED,
+         ds_put_format(&ds, "src ");
+         ipv6_format_mapped(&src, &ds);
+-        ds_put_format(&ds, "gateway ");
++        ds_put_format(&ds, "\ngateway ");
+         ipv6_format_mapped(&gw, &ds);
+         ds_put_format(&ds, "\ndev %s\n", iface);
+diff --git a/manpages.mk b/manpages.mk
+index fa9e59b..c18a1ab 100644
+--- a/manpages.mk
++++ b/manpages.mk
+@@ -3,11 +3,15 @@
+ ovn/utilities/ovn-sbctl.8: \
+ 	ovn/utilities/ovn-sbctl.8.in \
++	lib/common.man \
+ 	lib/db-ctl-base.man \
+ 	lib/table.man \
++	lib/vlog.man \
+ 	ovsdb/remote-active.man \
+ 	ovsdb/remote-passive.man
+ ovn/utilities/ovn-sbctl.8.in:
++lib/common.man:
+ lib/db-ctl-base.man:
+ lib/table.man:
++lib/vlog.man:
+ ovsdb/remote-active.man:
+ ovsdb/remote-passive.man:
+diff --git a/ofproto/ofproto-dpif-xlate.c b/ofproto/ofproto-dpif-xlate.c
+index a17047d..c33791f 100644
+--- a/ofproto/ofproto-dpif-xlate.c
++++ b/ofproto/ofproto-dpif-xlate.c
+@@ -2327,9 +2327,12 @@ xlate_normal_mcast_send_mrouters(struct xlate_ctx *ctx,
+     LIST_FOR_EACH(mrouter, mrouter_node, &ms->mrouter_lru) {
+         mcast_xbundle = xbundle_lookup(xcfg, mrouter->port);
+-        if (mcast_xbundle && mcast_xbundle != in_xbundle) {
++        if (mcast_xbundle && mcast_xbundle != in_xbundle
++            && mrouter->vlan == vlan) {
+             xlate_report(ctx, "forwarding to mcast router port");
+             output_normal(ctx, mcast_xbundle, vlan);
+         } else if (!mcast_xbundle) {
+             xlate_report(ctx, "mcast router port is unknown, dropping");
++        } else if (mrouter->vlan != vlan) {
++            xlate_report(ctx, "mcast router is on another vlan, dropping");
+         } else {
+             xlate_report(ctx, "mcast router port is input port, dropping");
+diff --git a/ofproto/ofproto.c b/ofproto/ofproto.c
+index d76e91c..2d39b91 100644
+--- a/ofproto/ofproto.c
++++ b/ofproto/ofproto.c
+@@ -3398,5 +3398,5 @@ handle_features_request(struct ofconn *ofconn, const struct ofp_header *oh)
+     features.capabilities = (OFPUTIL_C_FLOW_STATS | OFPUTIL_C_TABLE_STATS |
+                              OFPUTIL_C_PORT_STATS | OFPUTIL_C_QUEUE_STATS |
+-                             OFPUTIL_C_GROUP_STATS);
++                             OFPUTIL_C_GROUP_STATS | OFPUTIL_C_BUNDLES);
+     if (arp_match_ip) {
+         features.capabilities |= OFPUTIL_C_ARP_MATCH_IP;
+diff --git a/ovn/northd/ovn-northd.c b/ovn/northd/ovn-northd.c
+index d6a9dec..9c9a3b3 100644
+--- a/ovn/northd/ovn-northd.c
++++ b/ovn/northd/ovn-northd.c
+@@ -2671,5 +2671,5 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
+ 
+     /* Ingress table 9: ARP/ND responder, skip requests coming from localnet
+-     * ports. (priority 100). */
++     * and vtep ports. (priority 100). */
+     HMAP_FOR_EACH (op, key_node, ports) {
+         if (!op->nbsp) {
+@@ -2677,5 +2677,6 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
+         }
+ 
+-        if (!strcmp(op->nbsp->type, "localnet")) {
++        if ((!strcmp(op->nbsp->type, "localnet")) ||
++            (!strcmp(op->nbsp->type, "vtep"))) {
+             ds_clear(&match);
+             ds_put_format(&match, "inport == %s", op->json_key);
+diff --git a/ovn/utilities/ovn-sbctl.8.in b/ovn/utilities/ovn-sbctl.8.in
+index 5f0462a..8036397 100644
+--- a/ovn/utilities/ovn-sbctl.8.in
++++ b/ovn/utilities/ovn-sbctl.8.in
+@@ -98,4 +98,7 @@ would normally happen only if the database cannot be contacted, or if
+ the system is overloaded.)
+ .
++.so lib/vlog.man
++.so lib/common.man
++.
+ .SS "Table Formatting Options"
+ These options control the format of output from the \fBlist\fR and
+diff --git a/ovn/utilities/ovn-trace.c b/ovn/utilities/ovn-trace.c
+index f5607df..841aaf4 100644
+--- a/ovn/utilities/ovn-trace.c
++++ b/ovn/utilities/ovn-trace.c
+@@ -1174,9 +1174,9 @@ execute_get_mac_bind(const struct ovnact_get_mac_bind *bind,
+         = ovntrace_mac_binding_find(dp, port_key, &ip);
+ 
+-    const struct eth_addr mac = binding ? binding->mac : eth_addr_zero;
++    uflow->dl_dst = binding ? binding->mac : eth_addr_zero;
+     if (binding) {
+         ovntrace_node_append(super, OVNTRACE_NODE_ACTION,
+                              "/* MAC binding to "ETH_ADDR_FMT". */",
+-                             ETH_ADDR_ARGS(mac));
++                             ETH_ADDR_ARGS(uflow->dl_dst));
+     } else {
+         ovntrace_node_append(super, OVNTRACE_NODE_ACTION,
+@@ -1184,5 +1184,6 @@ execute_get_mac_bind(const struct ovnact_get_mac_bind *bind,
+     }
+     ovntrace_node_append(super, OVNTRACE_NODE_MODIFY,
+-                         "eth.dst = "ETH_ADDR_FMT, ETH_ADDR_ARGS(mac));
++                         "eth.dst = "ETH_ADDR_FMT,
++                         ETH_ADDR_ARGS(uflow->dl_dst));
+ }
+ 
+@@ -1345,5 +1346,5 @@ trace(const char *dp_s, const char *flow_s)
+     const struct ovntrace_datapath *dp = ovntrace_datapath_find_by_name(dp_s);
+     if (!dp) {
+-        ovs_fatal(0, "unknown datapath \"%s\"", dp_s);
++        return xasprintf("unknown datapath \"%s\"\n", dp_s);
+     }
+ 
+@@ -1352,5 +1353,5 @@ trace(const char *dp_s, const char *flow_s)
+                                        ovntrace_lookup_port, dp, &uflow);
+     if (error) {
+-        ovs_fatal(0, "error parsing flow: %s", error);
++        return xasprintf("error parsing flow: %s\n", error);
+     }
+ 
+diff --git a/rhel/usr_lib_systemd_system_ovn-controller-vtep.service b/rhel/usr_lib_systemd_system_ovn-controller-vtep.service
+index 867a906..978a5d8 100644
+--- a/rhel/usr_lib_systemd_system_ovn-controller-vtep.service
++++ b/rhel/usr_lib_systemd_system_ovn-controller-vtep.service
+@@ -29,2 +29,5 @@ ExecStart=/usr/bin/ovn-controller-vtep -vconsole:emer -vsyslog:err -vfile:info \
+           --no-chdir --pidfile=${OVS_RUNDIR}/ovn-controller-vtep.pid \
+           --ovnsb-db=${OVN_DB} --vtep-db=${VTEP_DB}
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/rhel/usr_lib_systemd_system_ovn-controller.service b/rhel/usr_lib_systemd_system_ovn-controller.service
+index 9bd2f66..4fa425b 100644
+--- a/rhel/usr_lib_systemd_system_ovn-controller.service
++++ b/rhel/usr_lib_systemd_system_ovn-controller.service
+@@ -19,2 +19,5 @@ RemainAfterExit=yes
+ ExecStart=/usr/share/openvswitch/scripts/ovn-ctl start_controller
+ ExecStop=/usr/share/openvswitch/scripts/ovn-ctl stop_controller
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/rhel/usr_lib_systemd_system_ovn-northd.service b/rhel/usr_lib_systemd_system_ovn-northd.service
+index 5b3b03a..9c9e941 100644
+--- a/rhel/usr_lib_systemd_system_ovn-northd.service
++++ b/rhel/usr_lib_systemd_system_ovn-northd.service
+@@ -11,2 +11,5 @@ Environment=OVS_RUNDIR=%t/openvswitch OVS_DBDIR=/var/lib/openvswitch
+ ExecStart=/usr/share/openvswitch/scripts/ovn-ctl start_northd
+ ExecStop=/usr/share/openvswitch/scripts/ovn-ctl stop_northd
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/tests/automake.mk b/tests/automake.mk
+index d42b576..94c332d 100644
+--- a/tests/automake.mk
++++ b/tests/automake.mk
+@@ -53,4 +53,5 @@ TESTSUITE_AT = \
+ 	tests/tunnel-push-pop.at \
+ 	tests/tunnel-push-pop-ipv6.at \
++	tests/ovs-router.at \
+ 	tests/lockfile.at \
+ 	tests/reconnect.at \
+@@ -95,5 +96,6 @@ TESTSUITE_AT = \
+ 	tests/ovn-sbctl.at \
+ 	tests/ovn-controller.at \
+-	tests/ovn-controller-vtep.at
++	tests/ovn-controller-vtep.at \
++	tests/mcast-snooping.at
+ 
+ SYSTEM_KMOD_TESTSUITE_AT = \
+diff --git a/tests/mcast-snooping.at b/tests/mcast-snooping.at
+new file mode 100644
+index 0000000..9cceace
+--- /dev/null
++++ b/tests/mcast-snooping.at
+@@ -0,0 +1,67 @@
++AT_BANNER([mcast snooping])
++
++AT_SETUP([mcast - check multicasts to trunk ports are not duplicated])
++
++OVS_VSWITCHD_START([])
++
++AT_CHECK([
++    ovs-vsctl set bridge br0 \
++    datapath_type=dummy \
++    mcast_snooping_enable=true \
++    other-config:mcast-snooping-disable-flood-unregistered=true
++], [0])
++
++AT_CHECK([ovs-ofctl add-flow br0 action=normal])
++
++# Create an access port p1 on vlan 1725, and a trunk port p2.
++AT_CHECK([
++    ovs-vsctl add-port br0 p1 tag=1725 -- set Interface p1 type=dummy \
++    other-config:hwaddr=aa:55:aa:55:00:01 ofport_request=1 \
++    -- add-port br0 p2 -- set Interface p2 type=dummy \
++    other-config:hwaddr=aa:55:aa:55:00:02 ofport_request=2
++], [0])
++
++AT_CHECK([ovs-appctl dpif/show], [0], [dnl
++dummy@ovs-dummy: hit:0 missed:0
++	br0:
++		br0 65534/100: (dummy-internal)
++		p1 1/1: (dummy)
++		p2 2/2: (dummy)
++])
++
++# Send IGMPv3 query on p2 with vlan 1725
++# 5c:8a:38:55:25:52 > 01:00:5e:00:00:01, ethertype 802.1Q (0x8100), length 64: vlan 1725, p 0, ethertype IPv4,
++# 172.17.25.1 > 224.0.0.1: igmp query v3
++AT_CHECK([ovs-appctl netdev-dummy/receive p2 \
++'01005e0000015c8a38552552810006bd080046c000240000000001027f00ac111901e0000001940400001164ec1e00000000027d000000000000000000000000'])
++
++# Send IGMPv3 query on p2 with vlan 1728
++# 5c:8a:38:55:25:52 > 01:00:5e:00:00:01, ethertype 802.1Q (0x8100), length 64: vlan 1728, p 0, ethertype IPv4,
++# 172.17.28.1 > 224.0.0.1: igmp query v3
++AT_CHECK([ovs-appctl netdev-dummy/receive p2 \
++'01005e0000015c8a38552552810006c0080046c000240000000001027c00ac111c01e0000001940400001164ec1e00000000027d000000000000000000000000'])
++
++AT_CHECK([ovs-appctl mdb/show br0], [0], [dnl
++ port  VLAN  GROUP                Age
++    2  1725  querier               0
++    2  1728  querier               0
++])
++
++AT_CHECK([ovs-vsctl set Interface p2 options:tx_pcap=p2.pcap])
++
++# Send a multicast packet on p1
++AT_CHECK([
++    ovs-appctl netdev-dummy/receive p1 \
++    'in_port(1),eth(src=aa:55:aa:55:00:01,dst=01:00:5e:5e:01:01),eth_type(0x0800),ipv4(src=10.0.0.1,dst=239.94.1.1,proto=17,tos=0,ttl=64,frag=no),udp(src=0,dst=8000)'
++])
++
++# Check this packet was forwarded exactly once to p2 and has vlan tag 1725
++# aa:55:aa:55:00:01 > 01:00:5e:5e:01:01, ethertype 802.1Q (0x8100), length 46: vlan 1725, p 0, ethertype IPv4,
++# 10.0.0.1.0 > 239.94.1.1.8000: UDP, length 0
++AT_CHECK([ovs-pcap p2.pcap > p2.pcap.txt 2>&1])
++AT_CHECK([cat p2.pcap.txt], [0], [dnl
++01005e5e0101aa55aa550001810006bd08004500001c00000000401180710a000001ef5e010100001f400008e63d
++])
++
++OVS_VSWITCHD_STOP
++AT_CLEANUP
+diff --git a/tests/ofp-print.at b/tests/ofp-print.at
+index ecc2c7a..4e82cd4 100644
+--- a/tests/ofp-print.at
++++ b/tests/ofp-print.at
+@@ -404,4 +404,28 @@ capabilities: FLOW_STATS TABLE_STATS PORT_STATS IP_REASM QUEUE_STATS PORT_BLOCKE
+ AT_CLEANUP
+ 
++AT_SETUP([OFPT_FEATURES_REPLY - OF1.4])
++AT_KEYWORDS([ofp-print])
++AT_CHECK([ovs-ofctl ofp-print "\
++05 06 00 20 00 00 00 01 00 00 50 54 00 00 00 01 \
++00 00 01 00 ff 00 00 00 00 00 07 6f 00 00 00 00 \
++"], [0], [dnl
++OFPT_FEATURES_REPLY (OF1.4) (xid=0x1): dpid:0000505400000001
++n_tables:255, n_buffers:256
++capabilities: FLOW_STATS TABLE_STATS PORT_STATS GROUP_STATS IP_REASM QUEUE_STATS PORT_BLOCKED BUNDLES FLOW_MONITORING
++])
++AT_CLEANUP
++
++AT_SETUP([OFPT_FEATURES_REPLY - OF1.5])
++AT_KEYWORDS([ofp-print])
++AT_CHECK([ovs-ofctl ofp-print "\
++06 06 00 20 00 00 00 01 00 00 50 54 00 00 00 01 \
++00 00 01 00 ff 00 00 00 00 00 07 6f 00 00 00 00 \
++"], [0], [dnl
++OFPT_FEATURES_REPLY (OF1.5) (xid=0x1): dpid:0000505400000001
++n_tables:255, n_buffers:256
++capabilities: FLOW_STATS TABLE_STATS PORT_STATS GROUP_STATS IP_REASM QUEUE_STATS PORT_BLOCKED BUNDLES FLOW_MONITORING
++])
++AT_CLEANUP
++
+ AT_SETUP([OFPT_FEATURES_REPLY - with auxiliary_id - OF1.3])
+ AT_KEYWORDS([ofp-print])
+diff --git a/tests/ofproto.at b/tests/ofproto.at
+index 6e55270..96a5e7e 100644
+--- a/tests/ofproto.at
++++ b/tests/ofproto.at
+@@ -1240,5 +1240,5 @@ do
+ OFPT_FEATURES_REPLY (OF1.4): dpid:fedcba9876543210
+ n_tables:254, n_buffers:256
+-capabilities: FLOW_STATS TABLE_STATS PORT_STATS GROUP_STATS QUEUE_STATS
++capabilities: FLOW_STATS TABLE_STATS PORT_STATS GROUP_STATS QUEUE_STATS BUNDLES
+ OFPST_PORT_DESC reply (OF1.4):
+  LOCAL(br0): addr:aa:55:aa:55:00:00
+diff --git a/tests/ovs-router.at b/tests/ovs-router.at
+new file mode 100644
+index 0000000..93a730a
+--- /dev/null
++++ b/tests/ovs-router.at
+@@ -0,0 +1,42 @@
++AT_BANNER([ovs-router])
++
++AT_SETUP([appctl - route/add with gateway])
++AT_KEYWORDS([ovs_router])
++AT_XFAIL_IF([test "$IS_WIN32" = "yes"])
++OVS_VSWITCHD_START([add-port br0 p2 -- set Interface p2 type=gre \
++			options:local_ip=2.2.2.2 options:remote_ip=1.1.1.1 \
++			-- add-port br0 p1  -- set interface p1 type=dummy])
++AT_CHECK([ovs-appctl netdev-dummy/ip4addr br0 2.2.2.2/24], [0], [OK
++])
++AT_CHECK([ovs-appctl ovs/route/add 1.1.1.0/24 br0 2.2.2.10], [0], [OK
++])
++OVS_VSWITCHD_STOP
++AT_CLEANUP
++
++AT_SETUP([appctl - route/lookup])
++AT_KEYWORDS([ovs_router])
++OVS_VSWITCHD_START([add-port br0 p1 -- set Interface p1 type=dummy])
++AT_CHECK([ovs-appctl netdev-dummy/ip4addr br0 192.0.2.1/24], [0], [OK
++])
++AT_CHECK([ovs-appctl ovs/route/add 198.51.100.0/24 br0 192.0.2.254], [0], [OK
++])
++AT_CHECK([ovs-appctl ovs/route/lookup 198.51.100.1], [0], [src 192.0.2.1
++gateway 192.0.2.254
++dev br0
++])
++OVS_VSWITCHD_STOP
++AT_CLEANUP
++
++AT_SETUP([appctl - route/lookup6])
++AT_KEYWORDS([ovs_router])
++OVS_VSWITCHD_START([add-port br0 p1 -- set Interface p1 type=dummy])
++AT_CHECK([ovs-appctl netdev-dummy/ip6addr br0 2001:db8:cafe::1/64], [0], [OK
++])
++AT_CHECK([ovs-appctl ovs/route/add 2001:db8:babe::/64 br0 2001:db8:cafe::2], [0], [OK
++])
++AT_CHECK([ovs-appctl ovs/route/lookup 2001:db8:babe::1eaf], [0], [src 2001:db8:cafe::1
++gateway 2001:db8:cafe::2
++dev br0
++])
++OVS_VSWITCHD_STOP
++AT_CLEANUP
+diff --git a/tests/pmd.at b/tests/pmd.at
+index 7b63b67..18b2972 100644
+--- a/tests/pmd.at
++++ b/tests/pmd.at
+@@ -518,4 +518,60 @@ OVS_VSWITCHD_STOP(["/dpif_netdev|WARN|There is no PMD thread on core/d"])
+ AT_CLEANUP
+ 
++AT_SETUP([PMD - rxq affinity - NUMA])
++OVS_VSWITCHD_START(
++  [], [], [], [--dummy-numa 0,0,0,1,1])
++AT_CHECK([ovs-appctl vlog/set dpif:dbg dpif_netdev:dbg])
++
++AT_CHECK([ovs-ofctl add-flow br0 actions=controller])
++
++AT_CHECK([ovs-vsctl set Open_vSwitch . other_config:pmd-cpu-mask=7e])
++
++AT_CHECK([ovs-vsctl add-port br0 p1 -- set Interface p1 type=dummy-pmd ofport_request=1 options:n_rxq=2 options:numa_id=0 other_config:pmd-rxq-affinity="0:1,1:2"])
++
++dnl The rxqs should be on the requested cores.
++AT_CHECK([ovs-appctl dpif-netdev/pmd-rxq-show | parse_pmd_rxq_show], [0], [dnl
++p1 0 0 1
++p1 1 0 2
++])
++
++AT_CHECK([ovs-vsctl set Interface p1 other_config:pmd-rxq-affinity="0:3,1:4"])
++
++dnl We moved the queues to different numa node. Expecting threads on
++dnl NUMA node 1 to be created.
++AT_CHECK([ovs-appctl dpif-netdev/pmd-rxq-show | parse_pmd_rxq_show], [0], [dnl
++p1 0 1 3
++p1 1 1 4
++])
++
++AT_CHECK([ovs-vsctl set Interface p1 other_config:pmd-rxq-affinity="0:3,1:1"])
++
++dnl Queues splitted between NUMA nodes.
++AT_CHECK([ovs-appctl dpif-netdev/pmd-rxq-show | parse_pmd_rxq_show], [0], [dnl
++p1 0 1 3
++p1 1 0 1
++])
++
++AT_CHECK([ovs-vsctl remove Interface p1 other_config pmd-rxq-affinity])
++
++dnl We removed the rxq-affinity request.  dpif-netdev should assign queues
++dnl in a round robin fashion.  We just make sure that every rxq is being
++dnl polled again.
++AT_CHECK([ovs-appctl dpif-netdev/pmd-rxq-show | parse_pmd_rxq_show | cut -f 1,2 -d ' ' | sort], [0], [dnl
++p1 0
++p1 1
++])
++
++AT_CHECK([ovs-vsctl set Interface p1 other_config:pmd-rxq-affinity='0:3'])
++
++dnl We explicitly requesting NUMA node 1 for queue 0.
++dnl Queue 1 should be polled by thread from NUMA node 0.
++AT_CHECK([ovs-appctl dpif-netdev/pmd-rxq-show | parse_pmd_rxq_show | cut -f 1,2,3 -d ' '], [0], [dnl
++p1 0 1
++p1 1 0
++])
++
++OVS_VSWITCHD_STOP
++AT_CLEANUP
++
+ AT_SETUP([PMD - monitor threads])
+ OVS_VSWITCHD_START(
+diff --git a/tests/testsuite.at b/tests/testsuite.at
+index f5f1253..d782e92 100644
+--- a/tests/testsuite.at
++++ b/tests/testsuite.at
+@@ -52,4 +52,5 @@ m4_include([tests/tunnel.at])
+ m4_include([tests/tunnel-push-pop.at])
+ m4_include([tests/tunnel-push-pop-ipv6.at])
++m4_include([tests/ovs-router.at])
+ m4_include([tests/lockfile.at])
+ m4_include([tests/reconnect.at])
+@@ -77,2 +78,3 @@ m4_include([tests/ovn-sbctl.at])
+ m4_include([tests/ovn-controller.at])
+ m4_include([tests/ovn-controller-vtep.at])
++m4_include([tests/mcast-snooping.at])
+diff --git a/utilities/ovs-ctl.in b/utilities/ovs-ctl.in
+index dc275f8..2825d44 100755
+--- a/utilities/ovs-ctl.in
++++ b/utilities/ovs-ctl.in
+@@ -109,5 +109,5 @@ set_system_ids () {
+     set "$@" external-ids:system-id="\"$SYSTEM_ID\""
+ 
+-    set "$@" external-ids:hostname="\"$(hostname)\""
++    set "$@" external-ids:hostname="\"$(hostname -f)\""
+ 
+     if test X"$SYSTEM_TYPE" != X; then
+diff --git a/utilities/ovs-ofctl.c b/utilities/ovs-ofctl.c
+index 935979a..d4d6309 100644
+--- a/utilities/ovs-ofctl.c
++++ b/utilities/ovs-ofctl.c
+@@ -714,4 +714,5 @@ bundle_print_errors(struct ovs_list *errors, struct ovs_list *requests)
+             ofp_print(stderr, ofp_msg, msg_len, verbosity + 1);
+         }
++        ofpbuf_uninit(&payload);
+         free(error);
+     }
+diff --git a/utilities/ovs-tcpdump.in b/utilities/ovs-tcpdump.in
+index b29e691..538b3b4 100755
+--- a/utilities/ovs-tcpdump.in
++++ b/utilities/ovs-tcpdump.in
+@@ -19,5 +19,4 @@ import netifaces
+ import os
+ import pwd
+-import select
+ import struct
+ import subprocess
+@@ -231,5 +230,6 @@ class OVSDB(object):
+         self._txn = None
+ 
+-    def destroy_mirror(self, mirror_name, bridge_name):
++    def destroy_mirror(self, intf_name, bridge_name):
++        mirror_name = 'm_%s' % intf_name
+         if not self.mirror_exists(mirror_name):
+             return
+@@ -427,15 +427,14 @@ def main():
+     try:
+         while pipes.poll() is None:
+-            data = pipes.stdout.readline()
++            data = pipes.stdout.readline().strip('\n')
+             if len(data) == 0:
+                 raise KeyboardInterrupt
+             print(data)
+-            if select.select([sys.stdin], [], [], 0.0)[0]:
+-                data_in = sys.stdin.read()
+-                pipes.stdin.write(data_in)
+         raise KeyboardInterrupt
+     except KeyboardInterrupt:
+-        pipes.terminate()
+-        ovsdb.destroy_mirror('m%s' % interface, ovsdb.port_bridge(interface))
++        if pipes.poll() is None:
++            pipes.terminate()
++
++        ovsdb.destroy_mirror(interface, ovsdb.port_bridge(interface))
+         ovsdb.destroy_port(mirror_interface, ovsdb.port_bridge(interface))
+     except Exception:
+diff --git a/vswitchd/vswitch.xml b/vswitchd/vswitch.xml
+index 976f3ca..b4f2d0a 100644
+--- a/vswitchd/vswitch.xml
++++ b/vswitchd/vswitch.xml
+@@ -74,5 +74,6 @@
+ 
+       <column name="external_ids" key="hostname">
+-        The hostname for the host running Open vSwitch.
++        The hostname for the host running Open vSwitch. This is a fully
++        qualified domain name since version 2.6.2.
+       </column>
+ 

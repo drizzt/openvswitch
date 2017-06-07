@@ -1,0 +1,252 @@
+From 3f08d2052db09253e8127424efaa696e54d242bb Mon Sep 17 00:00:00 2001
+From: Numan Siddique <nusiddiq@redhat.com>
+Date: Wed, 25 Jan 2017 13:25:12 +0530
+Subject: [PATCH] ovn-northd: Add flows in DHCP_OPTIONS pipeline to support
+ renew requests
+
+ovn-northd adds the flows to send the DHCPv4 packets to ovn-controller
+only with the match ip4.src = 0.0.0.0 and ip4.dst = 255.255.255.255.
+
+When a DHCPv4 lease is about to expire, before sending a DHCPDISCOVER
+packet, the client can send a DHCPREQUEST packet to renew its ip
+with ip4.src set to its offered ip and ip4.dst set to the DHCP server
+ip or broadcast ip.
+
+This patch supports this missing scenario by adding the necessary
+flows in DHCP_OPTIONS ingress pipeline.
+
+Signed-off-by: Numan Siddique <nusiddiq@redhat.com>
+Signed-off-by: Russell Bryant <russell@ovn.org>
+---
+ ovn/northd/ovn-northd.c | 37 +++++++++++++++++++---
+ tests/ovn.at            | 84 +++++++++++++++++++++++++++++++++++++++++++------
+ 2 files changed, 108 insertions(+), 13 deletions(-)
+
+diff --git a/ovn/northd/ovn-northd.c b/ovn/northd/ovn-northd.c
+index 62efd90..2dddd1b 100644
+--- a/ovn/northd/ovn-northd.c
++++ b/ovn/northd/ovn-northd.c
+@@ -1890,7 +1890,8 @@ lsp_is_up(const struct nbrec_logical_switch_port *lsp)
+ 
+ static bool
+ build_dhcpv4_action(struct ovn_port *op, ovs_be32 offer_ip,
+-                    struct ds *options_action, struct ds *response_action)
++                    struct ds *options_action, struct ds *response_action,
++                    struct ds *ipv4_addr_match)
+ {
+     if (!op->nbsp->dhcpv4_options) {
+         /* CMS has disabled native DHCPv4 for this lport. */
+@@ -1960,6 +1961,9 @@ build_dhcpv4_action(struct ovn_port *op, ovs_be32 offer_ip,
+                   "output;",
+                   server_mac, IP_ARGS(offer_ip), server_ip);
+ 
++    ds_put_format(ipv4_addr_match,
++                  "ip4.src == "IP_FMT" && ip4.dst == {%s, 255.255.255.255}",
++                  IP_ARGS(offer_ip), server_ip);
+     smap_destroy(&dhcpv4_options);
+     return true;
+ }
+@@ -2824,9 +2828,10 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
+             for (size_t j = 0; j < op->lsp_addrs[i].n_ipv4_addrs; j++) {
+                 struct ds options_action = DS_EMPTY_INITIALIZER;
+                 struct ds response_action = DS_EMPTY_INITIALIZER;
++                struct ds ipv4_addr_match = DS_EMPTY_INITIALIZER;
+                 if (build_dhcpv4_action(
+                         op, op->lsp_addrs[i].ipv4_addrs[j].addr,
+-                        &options_action, &response_action)) {
++                        &options_action, &response_action, &ipv4_addr_match)) {
+                     struct ds match = DS_EMPTY_INITIALIZER;
+                     ds_put_format(
+                         &match, "inport == %s && eth.src == %s && "
+@@ -2837,15 +2842,39 @@ build_lswitch_flows(struct hmap *datapaths, struct hmap *ports,
+                     ovn_lflow_add(lflows, op->od, S_SWITCH_IN_DHCP_OPTIONS,
+                                   100, ds_cstr(&match),
+                                   ds_cstr(&options_action));
++                    ds_clear(&match);
++                    /* Allow ip4.src = OFFER_IP and
++                     * ip4.dst = {SERVER_IP, 255.255.255.255} for the below
++                     * cases
++                     *  -  When the client wants to renew the IP by sending
++                     *     the DHCPREQUEST to the server ip.
++                     *  -  When the client wants to renew the IP by
++                     *     broadcasting the DHCPREQUEST.
++                     */
++                    ds_put_format(
++                        &match, "inport == %s && eth.src == %s && "
++                        "%s && udp.src == 68 && udp.dst == 67", op->json_key,
++                        op->lsp_addrs[i].ea_s, ds_cstr(&ipv4_addr_match));
++
++                    ovn_lflow_add(lflows, op->od, S_SWITCH_IN_DHCP_OPTIONS,
++                                  100, ds_cstr(&match),
++                                  ds_cstr(&options_action));
++                    ds_clear(&match);
++
+                     /* If REGBIT_DHCP_OPTS_RESULT is set, it means the
+-                     * put_dhcp_opts action  is successful */
+-                    ds_put_cstr(&match, " && "REGBIT_DHCP_OPTS_RESULT);
++                     * put_dhcp_opts action  is successful. */
++                    ds_put_format(
++                        &match, "inport == %s && eth.src == %s && "
++                        "ip4 && udp.src == 68 && udp.dst == 67"
++                        " && "REGBIT_DHCP_OPTS_RESULT, op->json_key,
++                        op->lsp_addrs[i].ea_s);
+                     ovn_lflow_add(lflows, op->od, S_SWITCH_IN_DHCP_RESPONSE,
+                                   100, ds_cstr(&match),
+                                   ds_cstr(&response_action));
+                     ds_destroy(&match);
+                     ds_destroy(&options_action);
+                     ds_destroy(&response_action);
++                    ds_destroy(&ipv4_addr_match);
+                     break;
+                 }
+             }
+diff --git a/tests/ovn.at b/tests/ovn.at
+index f2c941a..9d5e553 100644
+--- a/tests/ovn.at
++++ b/tests/ovn.at
+@@ -3577,8 +3577,17 @@ as hv1 ovs-vsctl show
+ # This shell function sends a DHCP request packet
+ # test_dhcp INPORT SRC_MAC DHCP_TYPE OFFER_IP ...
+ test_dhcp() {
+-    local inport=$1 src_mac=$2 dhcp_type=$3 offer_ip=$4
+-    local request=ffffffffffff${src_mac}080045100110000000008011000000000000ffffffff
++    local inport=$1 src_mac=$2 dhcp_type=$3 offer_ip=$4 use_ip=$5
++    shift; shift; shift; shift; shift;
++    if test $use_ip != 0; then
++        src_ip=$1
++        dst_ip=$2
++        shift; shift;
++    else
++        src_ip=`ip_to_hex 0 0 0 0`
++        dst_ip=`ip_to_hex 255 255 255 255`
++    fi
++    local request=ffffffffffff${src_mac}0800451001100000000080110000${src_ip}${dst_ip}
+     # udp header and dhcp header
+     request=${request}0044004300fc0000
+     request=${request}010106006359aa760000000000000000000000000000000000000000${src_mac}
+@@ -3598,7 +3607,7 @@ test_dhcp() {
+     request=${request}3501${dhcp_type}ff
+ 
+     if test $offer_ip != 0; then
+-        local srv_mac=$5 srv_ip=$6 expected_dhcp_opts=$7
++        local srv_mac=$1 srv_ip=$2 expected_dhcp_opts=$3
+         # total IP length will be the IP length of the request packet
+         # (which is 272 in our case) + 8 (padding bytes) + (expected_dhcp_opts / 2)
+         ip_len=`expr 280 + ${#expected_dhcp_opts} / 2`
+@@ -3634,7 +3643,6 @@ test_dhcp() {
+         reply=${reply}3501${dhcp_reply_type}${expected_dhcp_opts}00000000ff00000000
+         echo $reply >> $inport.expected
+     else
+-        shift; shift; shift; shift;
+         for outport; do
+             echo $request >> $outport.expected
+         done
+@@ -3680,7 +3688,7 @@ as hv1 ovs-ofctl dump-flows br-int
+ offer_ip=`ip_to_hex 10 0 0 4`
+ server_ip=`ip_to_hex 10 0 0 1`
+ expected_dhcp_opts=330400000e100104ffffff0003040a00000136040a000001
+-test_dhcp 1 f00000000001 01 $offer_ip ff1000000001 $server_ip $expected_dhcp_opts
++test_dhcp 1 f00000000001 01 $offer_ip 0 ff1000000001 $server_ip $expected_dhcp_opts
+ 
+ # NXT_RESUMEs should be 1.
+ OVS_WAIT_UNTIL([test 1 = `cat ofctl_monitor*.log | grep -c NXT_RESUME`])
+@@ -3703,7 +3711,7 @@ rm -f 2.expected
+ offer_ip=`ip_to_hex 10 0 0 6`
+ server_ip=`ip_to_hex 10 0 0 1`
+ expected_dhcp_opts=330400000e100104ffffff0003040a00000136040a000001
+-test_dhcp 2 f00000000002 03 $offer_ip ff1000000001 $server_ip $expected_dhcp_opts
++test_dhcp 2 f00000000002 03 $offer_ip 0 ff1000000001 $server_ip $expected_dhcp_opts
+ 
+ # NXT_RESUMEs should be 2.
+ OVS_WAIT_UNTIL([test 2 = `cat ofctl_monitor*.log | grep -c NXT_RESUME`])
+@@ -3725,7 +3733,7 @@ rm -f 2.expected
+ # ls1-lp1 (vif1-tx.pcap) should receive the DHCPv4 request packet twice,
+ # one from ovn-controller and the other from "ovs-ofctl resume."
+ offer_ip=0
+-test_dhcp 2 f00000000002 08 $offer_ip 1 1
++test_dhcp 2 f00000000002 08 $offer_ip 0 1 1
+ 
+ # NXT_RESUMEs should be 3.
+ OVS_WAIT_UNTIL([test 3 = `cat ofctl_monitor*.log | grep -c NXT_RESUME`])
+@@ -3741,11 +3749,11 @@ rm -f 2.expected
+ # Send DHCPv4 packet on ls2-lp1. It doesn't have any DHCPv4 options defined.
+ # ls2-lp2 (vif4-tx.pcap) should receive the DHCPv4 request packet once.
+ 
+-test_dhcp 3 f00000000003 01 0 4
++test_dhcp 3 f00000000003 01 0 4 0
+ 
+ # Send DHCPv4 packet on ls2-lp2. "router" DHCPv4 option is not defined for
+ # this lport.
+-test_dhcp 4 f00000000004 01 0 3
++test_dhcp 4 f00000000004 01 0 3 0
+ 
+ # NXT_RESUMEs should be 3.
+ OVS_WAIT_UNTIL([test 3 = `cat ofctl_monitor*.log | grep -c NXT_RESUME`])
+@@ -3753,6 +3761,64 @@ OVS_WAIT_UNTIL([test 3 = `cat ofctl_monitor*.log | grep -c NXT_RESUME`])
+ OVN_CHECK_PACKETS([hv1/vif3-tx.pcap], [3.expected])
+ OVN_CHECK_PACKETS([hv1/vif4-tx.pcap], [4.expected])
+ 
++# Send DHCPREQUEST with ip4.src set to 10.0.0.6 and ip4.dst set to 10.0.0.1.
++offer_ip=`ip_to_hex 10 0 0 6`
++server_ip=`ip_to_hex 10 0 0 1`
++expected_dhcp_opts=330400000e100104ffffff0003040a00000136040a000001
++src_ip=$offer_ip
++dst_ip=$server_ip
++test_dhcp 2 f00000000002 03 $offer_ip 1 $src_ip $dst_ip ff1000000001 $server_ip $expected_dhcp_opts
++
++# NXT_RESUMEs should be 4.
++OVS_WAIT_UNTIL([test 4 = `cat ofctl_monitor*.log | grep -c NXT_RESUME`])
++
++$PYTHON "$top_srcdir/utilities/ovs-pcap.in" hv1/vif2-tx.pcap > 2.packets
++cat 2.expected | cut -c -48 > expout
++AT_CHECK([cat 2.packets | cut -c -48], [0], [expout])
++# Skipping the IPv4 checksum.
++cat 2.expected | cut -c 53- > expout
++AT_CHECK([cat 2.packets | cut -c 53-], [0], [expout])
++
++reset_pcap_file hv1-vif1 hv1/vif1
++reset_pcap_file hv1-vif2 hv1/vif2
++rm -f 1.expected
++rm -f 2.expected
++
++# Send DHCPREQUEST with ip4.src set to 10.0.0.6 and ip4.dst set to 255.255.255.255.
++offer_ip=`ip_to_hex 10 0 0 6`
++server_ip=`ip_to_hex 10 0 0 1`
++expected_dhcp_opts=330400000e100104ffffff0003040a00000136040a000001
++src_ip=$offer_ip
++dst_ip=`ip_to_hex 255 255 255 255`
++test_dhcp 2 f00000000002 03 $offer_ip 1 $src_ip $dst_ip ff1000000001 $server_ip $expected_dhcp_opts
++
++# NXT_RESUMEs should be 5.
++OVS_WAIT_UNTIL([test 5 = `cat ofctl_monitor*.log | grep -c NXT_RESUME`])
++
++$PYTHON "$top_srcdir/utilities/ovs-pcap.in" hv1/vif2-tx.pcap > 2.packets
++cat 2.expected | cut -c -48 > expout
++AT_CHECK([cat 2.packets | cut -c -48], [0], [expout])
++# Skipping the IPv4 checksum.
++cat 2.expected | cut -c 53- > expout
++AT_CHECK([cat 2.packets | cut -c 53-], [0], [expout])
++
++reset_pcap_file hv1-vif1 hv1/vif1
++reset_pcap_file hv1-vif2 hv1/vif2
++rm -f 1.expected
++rm -f 2.expected
++
++# Send DHCPREQUEST with ip4.src set to 10.0.0.6 and ip4.dst set to 10.0.0.4.
++# The packet should not be received by ovn-controller.
++src_ip=`ip_to_hex 10 0 0 6`
++dst_ip=`ip_to_hex 10 0 0 4`
++test_dhcp 2 f00000000002 03 0 1 $src_ip $dst_ip 1
++
++# NXT_RESUMEs should be 5.
++OVS_WAIT_UNTIL([test 5 = `cat ofctl_monitor*.log | grep -c NXT_RESUME`])
++
++# vif1-tx.pcap should have received the DHCPv4 request packet
++OVN_CHECK_PACKETS([hv1/vif1-tx.pcap], [1.expected])
++
+ as hv1
+ OVS_APP_EXIT_AND_WAIT([ovn-controller])
+ OVS_APP_EXIT_AND_WAIT([ovs-vswitchd])
+-- 
+2.9.3
+

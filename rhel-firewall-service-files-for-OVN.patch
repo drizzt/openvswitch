@@ -1,0 +1,100 @@
+commit 55f36be59122883afac2209d7cf12ddbd10a18ff
+Author: Marcin Mirecki <mmirecki@redhat.com>
+Date:   Fri Feb 3 15:47:50 2017 -0500
+
+    rhel: Firewall service files for OVN.
+    
+    Firewall service files allowing to open firewalld
+    ports required for running OVN
+    
+    Signed-off-by: Marcin Mirecki <mmirecki@redhat.com>
+    Acked-by: Ben Pfaff <blp@ovn.org>
+    Signed-off-by: Russell Bryant <russell@ovn.org>
+
+diff --git a/rhel/automake.mk b/rhel/automake.mk
+index 45aa9b1..df4c19a 100644
+--- a/rhel/automake.mk
++++ b/rhel/automake.mk
+@@ -30,7 +30,10 @@ EXTRA_DIST += \
+ 	rhel/usr_lib_systemd_system_ovs-vswitchd.service \
+ 	rhel/usr_lib_systemd_system_ovn-controller.service \
+ 	rhel/usr_lib_systemd_system_ovn-controller-vtep.service \
+-	rhel/usr_lib_systemd_system_ovn-northd.service
++	rhel/usr_lib_systemd_system_ovn-northd.service \
++	rhel/usr_lib_systemd_system_ovn-northd.service \
++	rhel/usr_lib_firewalld_services_ovn-central-firewall-service.xml \
++	rhel/usr_lib_firewalld_services_ovn-host-firewall-service.xml
+ 
+ update_rhel_spec = \
+   $(AM_V_GEN)($(ro_shell) && sed -e 's,[@]VERSION[@],$(VERSION),g') \
+diff --git a/rhel/openvswitch-fedora.spec.in b/rhel/openvswitch-fedora.spec.in
+index 65e937c..262acd0 100644
+--- a/rhel/openvswitch-fedora.spec.in
++++ b/rhel/openvswitch-fedora.spec.in
+@@ -127,6 +127,7 @@ files needed to build an external application.
+ Summary: Open vSwitch - Open Virtual Network support
+ License: ASL 2.0
+ Requires: openvswitch openvswitch-ovn-common
++Requires: firewalld-filesystem
+ 
+ %description ovn-central
+ OVN, the Open Virtual Network, is a system to support virtual network
+@@ -138,6 +139,7 @@ overlays and security groups.
+ Summary: Open vSwitch - Open Virtual Network support
+ License: ASL 2.0
+ Requires: openvswitch openvswitch-ovn-common
++Requires: firewalld-filesystem
+ 
+ %description ovn-host
+ OVN, the Open Virtual Network, is a system to support virtual network
+@@ -232,6 +234,11 @@ touch $RPM_BUILD_ROOT%{_sysconfdir}/openvswitch/system-id.conf
+ install -p -m 644 -D selinux/openvswitch-custom.pp \
+         $RPM_BUILD_ROOT%{_datadir}/selinux/packages/%{name}/openvswitch-custom.pp
+ 
++install rhel/usr_lib_firewalld_services_ovn-central-firewall-service.xml \
++        $RPM_BUILD_ROOT%{_prefix}/lib/firewalld/services/ovn-central-firewall-service.xml
++install rhel/usr_lib_firewalld_services_ovn-host-firewall-service.xml \
++        $RPM_BUILD_ROOT%{_prefix}/lib/firewalld/services/ovn-host-firewall-service.xml
++
+ # remove unpackaged files
+ rm -f $RPM_BUILD_ROOT%{_bindir}/ovs-parse-backtrace \
+         $RPM_BUILD_ROOT%{_sbindir}/ovs-vlan-bug-workaround \
+@@ -517,11 +524,13 @@ fi
+ %config %{_datadir}/openvswitch/ovn-nb.ovsschema
+ %config %{_datadir}/openvswitch/ovn-sb.ovsschema
+ %{_unitdir}/ovn-northd.service
++${_prefix}/lib/firewalld/services/ovn-central-firewall-service.xml
+ 
+ %files ovn-host
+ %{_bindir}/ovn-controller
+ %{_mandir}/man8/ovn-controller.8*
+ %{_unitdir}/ovn-controller.service
++${_prefix}/lib/firewalld/services/ovn-host-firewall-service.xml
+ 
+ %files ovn-vtep
+ %{_bindir}/ovn-controller-vtep
+diff --git a/rhel/usr_lib_firewalld_services_ovn-central-firewall-service.xml b/rhel/usr_lib_firewalld_services_ovn-central-firewall-service.xml
+new file mode 100644
+index 0000000..e7f871d
+--- /dev/null
++++ b/rhel/usr_lib_firewalld_services_ovn-central-firewall-service.xml
+@@ -0,0 +1,7 @@
++<?xml version="1.0" encoding="utf-8"?>
++<service>
++  <short>ovn-central-firewall-service</short>
++  <description>Firewall service for ovn central</description>
++  <port protocol="tcp" port="6641"/>
++  <port protocol="tcp" port="6442"/>
++</service>
+diff --git a/rhel/usr_lib_firewalld_services_ovn-host-firewall-service.xml b/rhel/usr_lib_firewalld_services_ovn-host-firewall-service.xml
+new file mode 100644
+index 0000000..f606890
+--- /dev/null
++++ b/rhel/usr_lib_firewalld_services_ovn-host-firewall-service.xml
+@@ -0,0 +1,6 @@
++<?xml version="1.0" encoding="utf-8"?>
++<service>
++  <short>ovn-host-firewall-service</short>
++  <description>Firewall service for ovn host</description>
++  <port protocol="udp" port="6081"/>
++</service>
