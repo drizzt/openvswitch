@@ -31,6 +31,8 @@ Name: openvswitch
 Summary: Open vSwitch
 Group: System Environment/Daemons daemon/database/utilities
 URL: http://www.openvswitch.org/
+# To win over 2.6.90 build http://cbs.centos.org/koji/buildinfo?buildID=15349
+Epoch: 1
 Version: 2.6.1
 
 # Nearly all of openvswitch is ASL 2.0.  The bugtool is LGPLv2+, and the
@@ -143,7 +145,7 @@ Python bindings for the Open vSwitch database
 Summary: Open vSwitch testing utilities
 License: ASL 2.0
 BuildArch: noarch
-Requires: python-openvswitch = %{version}-%{release}
+Requires: python-openvswitch = %{epoch}:%{version}-%{release}
 Requires: python python-twisted-core python-twisted-web
 
 %description test
